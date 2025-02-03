@@ -6,6 +6,8 @@ from libcpp.pair cimport pair
 from libcpp.queue cimport priority_queue
 from libcpp.string cimport string
 from libcpp.vector cimport vector
+from cython.parallel import prange
+
 
 import numpy as np
 cimport numpy as cnp
@@ -620,6 +622,8 @@ cdef class QuantileForest:
         cdef vector[double] pred
         cdef cnp.ndarray[float64_t, ndim=3] preds
         cdef double[:, :, :] preds_view
+        cdef vector[double] local_leaf_weights
+        cdef vector[double] local_leaf_samples
 
         n_samples = X_leaves.shape[0]
         n_outputs = self.y_train.size()
@@ -698,82 +702,99 @@ cdef class QuantileForest:
                             )
 
                     if weighted_quantile:
-                        for k in range(<intp_t>(train_weights.size())):
-                            train_weights[k].clear()
-                        for k in range(n_trees):
-                            if X_indices is None or X_indices[i, k] is True:
+                        # Clear each train_weights vector in parallel.
+                        for k in prange(<intp_t>train_weights.size(), schedule="static"):
+                            with gil:
+                                train_weights[k].clear()
+
+                        # Loop over trees in parallel.
+                        for k in prange(n_trees, schedule="static"):
+                            if X_indices is None or X_indices[i, k]:
                                 idx = 0 if aggregate_leaves_first else k
-                                train_wgt = 1
                                 if weighted_leaves:
-                                    train_wgt = 0
                                     if n_leaf_samples[k] > 0:
-                                        train_wgt = 1 / <double>n_leaf_samples[k]
-                                        train_wgt *= <double>n_total_samples
-                                        train_wgt /= <double>n_total_trees
-                                train_weights[idx].insert(
-                                    train_weights[idx].end(), max_idx, train_wgt
-                                )
+                                        # Compute train_wgt in one expression.
+                                        train_wgt = (1.0 / <double>n_leaf_samples[k]) * (<double>n_total_samples) / (<double>n_total_trees)
+                                    else:
+                                        train_wgt = 0.0
+                                else:
+                                    train_wgt = 1.0
+
+                                # Insert into the C++ vector; this call requires the GIL.
+                                with gil:
+                                    train_weights[idx].insert(train_weights[idx].end(), max_idx, train_wgt)
 
                         # For each list of training indices, calculate output.
-                        for k in range(<intp_t>(train_indices.size())):
+                        for k in prange(<intp_t>train_indices.size(), schedule="static"):
                             if train_indices[k].size() == 0:
                                 continue
 
-                            # Reset leaf weights for all training indices to 0.
-                            memset(&leaf_weights[0], 0, n_train * sizeof(double))
+                            # Allocate a thread-local copy of leaf_weights.
+                            local_leaf_weights = vector[double](n_train)
+                            memset(&local_leaf_weights[0], 0, n_train * sizeof(double))
 
-                            # Sum the weights/counts for each training index.
-                            for l in range(<intp_t>(train_indices[k].size())):
+                            # Sum the weights for each training index.
+                            for l in range(<intp_t>train_indices[k].size()):
                                 train_idx = train_indices[k][l]
                                 train_wgt = train_weights[k][l]
                                 if train_idx != 0:
-                                    leaf_weights[train_idx - 1] += train_wgt
+                                    local_leaf_weights[train_idx - 1] += train_wgt
 
-                            # Calculate quantiles (or mean).
+                            # Calculate quantiles (or mean) and append to leaf_preds.
                             if not use_mean:
                                 pred = calc_weighted_quantile(
                                     self.y_train[j],
-                                    leaf_weights,
+                                    local_leaf_weights,
                                     quantiles,
                                     interpolation,
                                     issorted=True,
                                 )
-                                for l in range(<intp_t>(pred.size())):
-                                    leaf_preds[l].push_back(pred[l])
+                                # Appending to the shared vector requires the GIL.
+                                with gil:
+                                    for l in range(<intp_t>pred.size()):
+                                        leaf_preds[l].push_back(pred[l])
                             else:
                                 if self.y_train[j].size() > 0:
                                     pred = vector[double](1)
-                                    pred[0] = calc_weighted_mean(self.y_train[j], leaf_weights)
-                                    leaf_preds[0].push_back(pred[0])
+                                    pred[0] = calc_weighted_mean(self.y_train[j], local_leaf_weights)
+                                    with gil:
+                                        leaf_preds[0].push_back(pred[0])
                     else:
-                        # For each list of training indices, calculate output.
-                        for k in range(<intp_t>(train_indices.size())):
+                        # Parallelize over each list of training indices.
+                        for k in prange(<intp_t>train_indices.size(), schedule="static"):
+                            # Create a thread-local copy of leaf_samples.
+                            local_leaf_samples = vector[double]()
+                            # If there are no training indices for this leaf, skip to the next.
                             if train_indices[k].size() == 0:
                                 continue
 
-                            # Clear list of training target values.
-                            leaf_samples.clear()
-
-                            # Get training target values associated with indices.
+                            # Populate the thread-local list of training target values.
+                            # (train_indices[k] is a C++ vector so iteration is safe in nogil mode.)
                             for train_idx in train_indices[k]:
                                 if train_idx != 0:
-                                    leaf_samples.push_back(self.y_train[j][train_idx - 1])
+                                    # Assume self.y_train[j] is a C++ vector accessible without the GIL.
+                                    local_leaf_samples.push_back(self.y_train[j][train_idx - 1])
 
-                            # Calculate quantiles (or mean).
+                            # Calculate quantiles or mean.
                             if not use_mean:
+                                # calc_quantile should be defined as nogil-safe if possible.
                                 pred = calc_quantile(
-                                    leaf_samples,
+                                    local_leaf_samples,
                                     quantiles,
                                     interpolation,
                                     issorted=False,
                                 )
-                                for l in range(<intp_t>(pred.size())):
-                                    leaf_preds[l].push_back(pred[l])
+                                # Because leaf_preds is a shared data structure, protect its update.
+                                with gil:
+                                    for l in range(<intp_t>pred.size()):
+                                        leaf_preds[l].push_back(pred[l])
                             else:
-                                if leaf_samples.size() > 0:
+                                if local_leaf_samples.size() > 0:
                                     pred = vector[double](1)
-                                    pred[0] = calc_mean(leaf_samples)
-                                    leaf_preds[0].push_back(pred[0])
+                                    pred[0] = calc_mean(local_leaf_samples)
+                                    with gil:
+                                        leaf_preds[0].push_back(pred[0])
+
 
                     # Average the quantile predictions across accumulations.
                     for k in range(<intp_t>(leaf_preds.size())):
@@ -781,7 +802,6 @@ cdef class QuantileForest:
                             preds_view[i, j, k] = leaf_preds[k][0]
                         elif leaf_preds[k].size() > 1:
                             preds_view[i, j, k] = calc_mean(leaf_preds[k])
-
         return np.asarray(preds_view)
 
     cpdef cnp.ndarray quantile_ranks(
