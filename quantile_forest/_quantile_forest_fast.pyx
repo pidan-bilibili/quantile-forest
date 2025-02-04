@@ -6,7 +6,9 @@ from libcpp.pair cimport pair
 from libcpp.queue cimport priority_queue
 from libcpp.string cimport string
 from libcpp.vector cimport vector
-from cython.parallel import prange
+from cython.parallel import prange, parallel
+from libc.stdlib cimport malloc, free
+
 
 
 import numpy as np
@@ -704,8 +706,7 @@ cdef class QuantileForest:
                     if weighted_quantile:
                         # Clear each train_weights vector in parallel.
                         for k in prange(<intp_t>train_weights.size(), schedule="static"):
-                            with gil:
-                                train_weights[k].clear()
+                            train_weights[k].clear()
 
                         # Loop over trees in parallel.
                         for k in prange(n_trees, schedule="static"):
@@ -719,10 +720,8 @@ cdef class QuantileForest:
                                         train_wgt = 0.0
                                 else:
                                     train_wgt = 1.0
-
                                 # Insert into the C++ vector; this call requires the GIL.
-                                with gil:
-                                    train_weights[idx].insert(train_weights[idx].end(), max_idx, train_wgt)
+                                train_weights[idx].insert(train_weights[idx].end(), max_idx, train_wgt)
 
                         # For each list of training indices, calculate output.
                         for k in prange(<intp_t>train_indices.size(), schedule="static"):
@@ -750,15 +749,13 @@ cdef class QuantileForest:
                                     issorted=True,
                                 )
                                 # Appending to the shared vector requires the GIL.
-                                with gil:
-                                    for l in range(<intp_t>pred.size()):
+                                for l in range(<intp_t>pred.size()):
                                         leaf_preds[l].push_back(pred[l])
                             else:
                                 if self.y_train[j].size() > 0:
                                     pred = vector[double](1)
                                     pred[0] = calc_weighted_mean(self.y_train[j], local_leaf_weights)
-                                    with gil:
-                                        leaf_preds[0].push_back(pred[0])
+                                    leaf_preds[0].push_back(pred[0])
                     else:
                         # Parallelize over each list of training indices.
                         for k in prange(<intp_t>train_indices.size(), schedule="static"):
@@ -785,15 +782,13 @@ cdef class QuantileForest:
                                     issorted=False,
                                 )
                                 # Because leaf_preds is a shared data structure, protect its update.
-                                with gil:
-                                    for l in range(<intp_t>pred.size()):
+                                for l in range(<intp_t>pred.size()):
                                         leaf_preds[l].push_back(pred[l])
                             else:
                                 if local_leaf_samples.size() > 0:
                                     pred = vector[double](1)
                                     pred[0] = calc_mean(local_leaf_samples)
-                                    with gil:
-                                        leaf_preds[0].push_back(pred[0])
+                                    leaf_preds[0].push_back(pred[0])
 
 
                     # Average the quantile predictions across accumulations.
@@ -803,6 +798,8 @@ cdef class QuantileForest:
                         elif leaf_preds[k].size() > 1:
                             preds_view[i, j, k] = calc_mean(leaf_preds[k])
         return np.asarray(preds_view)
+
+
 
     cpdef cnp.ndarray quantile_ranks(
         self,
